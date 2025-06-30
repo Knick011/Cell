@@ -6,6 +6,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import cv2
 import os
 import pandas as pd
+from scipy import ndimage
+from skimage import feature, filters, morphology, measure
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
 
 try:
     from nd2reader import ND2Reader
@@ -17,7 +21,7 @@ except ImportError:
 class CellAnalyzer:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Cell Analysis - Droplet & Cell Detection")
+        self.root.title("Cell Analysis - Enhanced Droplet & Cancer Cell Detection")
         self.root.geometry("1400x900")
         self.root.state('zoomed')  # Maximize window on Windows
         
@@ -130,7 +134,7 @@ class CellAnalyzer:
         
     def load_nd2_file(self):
         if not ND2_AVAILABLE:
-            messagebox.showerror("Error", "nd2reader not installed.\\nRun: pip install nd2reader")
+            messagebox.showerror("Error", "nd2reader not installed.\nRun: pip install nd2reader")
             return
             
         file_path = filedialog.askopenfilename(
@@ -179,353 +183,504 @@ class CellAnalyzer:
                                    foreground='green')
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load ND2 file:\\n{str(e)}")
+            messagebox.showerror("Error", f"Failed to load ND2 file:\n{str(e)}")
             self.status_label.config(text="❌ Error loading file", foreground='red')
     
-    def detect_droplets(self, image):
-        """Detect droplets by finding the characteristic black circular rings"""
+    def detect_droplets_enhanced(self, image):
+        """Enhanced droplet detection for both thick and thin rings"""
         try:
-            # Convert to uint8 if needed
+            # Normalize image
             if image.dtype != np.uint8:
                 image_normalized = ((image - image.min()) / (image.max() - image.min()) * 255).astype(np.uint8)
             else:
                 image_normalized = image.copy()
             
-            # Apply bilateral filter to preserve edges while reducing noise
-            bilateral = cv2.bilateralFilter(image_normalized, 9, 75, 75)
+            # Apply multiple preprocessing techniques
+            droplets = []
             
-            # Apply Canny edge detection
-            edges = cv2.Canny(bilateral, 30, 80, apertureSize=3, L2gradient=True)
+            # Method 1: Gradient-based detection for rings
+            droplets1 = self.detect_droplets_by_gradient(image_normalized)
+            droplets.extend(droplets1)
             
-            # Dilate edges to make them more prominent
-            kernel = np.ones((3, 3), np.uint8)
-            edges = cv2.dilate(edges, kernel, iterations=1)
+            # Method 2: Circular Hough Transform with multiple parameters
+            droplets2 = self.detect_droplets_by_hough(image_normalized)
+            droplets.extend(droplets2)
             
-            # Use HoughCircles on edge image
+            # Method 3: Template matching for circular patterns
+            droplets3 = self.detect_droplets_by_template(image_normalized)
+            droplets.extend(droplets3)
+            
+            # Merge overlapping detections
+            merged_droplets = self.merge_droplet_detections(droplets)
+            
+            # Validate and rank droplets
+            validated_droplets = []
+            for i, droplet in enumerate(merged_droplets):
+                if self.validate_droplet_enhanced(image_normalized, droplet['x'], droplet['y'], droplet['r']):
+                    droplet['id'] = i + 1
+                    validated_droplets.append(droplet)
+            
+            print(f"Detected {len(validated_droplets)} droplets")
+            return validated_droplets
+            
+        except Exception as e:
+            print(f"Error in enhanced droplet detection: {e}")
+            return []
+    
+    def detect_droplets_by_gradient(self, image):
+        """Detect droplets using gradient magnitude"""
+        try:
+            # Calculate gradients
+            sobelx = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+            
+            # Normalize gradient
+            gradient_norm = ((gradient_magnitude - gradient_magnitude.min()) / 
+                           (gradient_magnitude.max() - gradient_magnitude.min()) * 255).astype(np.uint8)
+            
+            # Apply threshold to get ring structures
+            _, binary = cv2.threshold(gradient_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Find circular patterns in gradient image
             circles = cv2.HoughCircles(
-                edges,
+                binary,
                 cv2.HOUGH_GRADIENT,
-                dp=1,
-                minDist=150,
+                dp=1.2,
+                minDist=100,
                 param1=50,
-                param2=20,
-                minRadius=80,
-                maxRadius=160
+                param2=15,
+                minRadius=60,
+                maxRadius=180
             )
             
             droplets = []
             if circles is not None:
                 circles = np.round(circles[0, :]).astype("int")
-                
-                # Filter circles that actually correspond to black rings
-                valid_circles = []
                 for (x, y, r) in circles:
-                    if self.validate_droplet_ring(image_normalized, x, y, r):
-                        valid_circles.append((x, y, r))
-                
-                # Sort by position (top to bottom, left to right)
-                valid_circles = sorted(valid_circles, key=lambda c: (c[1], c[0]))
-                
-                for i, (x, y, r) in enumerate(valid_circles):
                     droplets.append({
-                        'id': i + 1,
+                        'x': x, 'y': y, 'r': r,
                         'center': (x, y),
                         'radius': r,
-                        'x': x,
-                        'y': y,
-                        'r': r
+                        'method': 'gradient'
                     })
             
             return droplets
             
         except Exception as e:
-            print(f"Error in droplet detection: {e}")
+            print(f"Error in gradient detection: {e}")
             return []
     
-    def validate_droplet_ring(self, image, x, y, r):
-        """Validate that a detected circle actually corresponds to a black ring droplet"""
+    def detect_droplets_by_hough(self, image):
+        """Multiple Hough transform passes with different parameters"""
         try:
-            # Check if circle is within image bounds
-            if x - r < 10 or y - r < 10 or x + r > image.shape[1] - 10 or y + r > image.shape[0] - 10:
-                return False
+            # Preprocess
+            blurred = cv2.GaussianBlur(image, (5, 5), 1)
             
-            # Sample pixels around the circle perimeter
-            angles = np.linspace(0, 2*np.pi, 32)
-            ring_intensities = []
+            all_droplets = []
             
-            for angle in angles:
-                ring_x = int(x + r * np.cos(angle))
-                ring_y = int(y + r * np.sin(angle))
-                
-                if 0 <= ring_x < image.shape[1] and 0 <= ring_y < image.shape[0]:
-                    ring_intensities.append(image[ring_y, ring_x])
-            
-            if len(ring_intensities) < 20:
-                return False
-            
-            # Check if the ring area is darker than the center
-            center_intensity = np.mean(image[max(0, y-10):min(image.shape[0], y+10), 
-                                            max(0, x-10):min(image.shape[1], x+10)])
-            ring_intensity = np.mean(ring_intensities)
-            
-            # Black ring should be significantly darker than center
-            return ring_intensity < center_intensity - 20
-            
-        except Exception as e:
-            print(f"Error validating droplet ring: {e}")
-            return False
-    
-    def detect_cells_in_droplet(self, image, tritc_image, droplet):
-        """Detect and analyze cells within a single droplet"""
-        try:
-            x, y, r = droplet['x'], droplet['y'], droplet['r']
-            
-            # Create circular mask for the droplet
-            mask = np.zeros(image.shape, dtype=np.uint8)
-            cv2.circle(mask, (x, y), int(r * 0.8), 255, -1)
-            
-            # Extract droplet regions
-            droplet_region = cv2.bitwise_and(image, image, mask=mask)
-            tritc_region = cv2.bitwise_and(tritc_image, tritc_image, mask=mask)
-            
-            # Convert to uint8 if needed
-            if droplet_region.dtype != np.uint8:
-                droplet_region = ((droplet_region - droplet_region.min()) / 
-                                (droplet_region.max() - droplet_region.min() + 1e-8) * 255).astype(np.uint8)
-            
-            if tritc_region.dtype != np.uint8:
-                tritc_region = ((tritc_region - tritc_region.min()) / 
-                              (tritc_region.max() - tritc_region.min() + 1e-8) * 255).astype(np.uint8)
-            
-            # Detect all cells using brightfield morphology
-            all_cells = self.detect_cells_brightfield(droplet_region, mask)
-            
-            # Classify cells based on size and TRITC signal
-            k562_cells = []
-            nk_cells = []
-            
-            for cell in all_cells:
-                # Check TRITC signal at cell location
-                cell_mask = np.zeros_like(tritc_region)
-                cv2.drawContours(cell_mask, [cell['contour']], -1, 255, -1)
-                tritc_intensity = cv2.mean(tritc_region, mask=cell_mask)[0]
-                
-                # Classify based on size and TRITC signal
-                if cell['area'] > 200 or tritc_intensity > 15:
-                    cell['type'] = 'K562'
-                    cell['tritc_intensity'] = tritc_intensity
-                    cell['viable'] = tritc_intensity > 20 and cell['circularity'] > 0.5
-                    k562_cells.append(cell)
-                else:
-                    cell['type'] = 'NK'
-                    cell['tritc_intensity'] = tritc_intensity
-                    cell['viable'] = 50 < cell['area'] < 500 and cell['circularity'] > 0.4
-                    nk_cells.append(cell)
-            
-            return {
-                'k562_cells': k562_cells,
-                'nk_cells': nk_cells,
-                'total_cells': len(k562_cells) + len(nk_cells)
-            }
-            
-        except Exception as e:
-            print(f"Error detecting cells in droplet: {e}")
-            return {'k562_cells': [], 'nk_cells': [], 'total_cells': 0}
-    
-    def detect_cells_brightfield(self, bf_image, mask):
-        """Enhanced cell detection using multiple approaches"""
-        try:
-            # Apply mask
-            masked_bf = cv2.bitwise_and(bf_image, bf_image, mask=mask)
-            
-            # Skip if no signal in masked region
-            if cv2.mean(masked_bf, mask=mask)[0] < 10:
-                return []
-            
-            # Enhance contrast more aggressively
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
-            enhanced = clahe.apply(masked_bf)
-            
-            # Apply additional preprocessing
-            blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
-            
-            all_cells = []
-            
-            # Method 1: Very sensitive blob detection
-            cells1 = self.detect_blobs_sensitive(blurred, mask)
-            all_cells.extend(cells1)
-            
-            # Method 2: Laplacian of Gaussian for cell detection
-            cells2 = self.detect_cells_log(blurred, mask)
-            all_cells.extend(cells2)
-            
-            # Method 3: Multi-scale template matching
-            cells3 = self.detect_cells_template_matching(blurred, mask)
-            all_cells.extend(cells3)
-            
-            # Method 4: Watershed segmentation
-            cells4 = self.detect_cells_watershed(blurred, mask)
-            all_cells.extend(cells4)
-            
-            # Remove duplicates and filter
-            merged_cells = self.merge_duplicate_cells(all_cells)
-            
-            # Additional filtering by reasonable cell criteria
-            filtered_cells = []
-            for cell in merged_cells:
-                if (20 < cell['area'] < 8000 and  # Broader size range
-                    cell['circularity'] > 0.1):     # Very loose circularity
-                    filtered_cells.append(cell)
-            
-            print(f"Detected {len(filtered_cells)} cells using enhanced methods")
-            return filtered_cells
-            
-        except Exception as e:
-            print(f"Error in enhanced cell detection: {e}")
-            return []
-    
-    def detect_blobs_sensitive(self, image, mask):
-        """Very sensitive blob detection for small/faint cells"""
-        try:
-            cells = []
-            
-            # Multiple threshold levels to catch faint cells
-            threshold_methods = [
-                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            # Multiple parameter sets for different droplet types
+            param_sets = [
+                # For thick rings
+                {'dp': 1, 'minDist': 120, 'param1': 50, 'param2': 30, 
+                 'minRadius': 80, 'maxRadius': 160},
+                # For thin rings
+                {'dp': 1.5, 'minDist': 100, 'param1': 30, 'param2': 20, 
+                 'minRadius': 60, 'maxRadius': 180},
+                # For edge cases
+                {'dp': 2, 'minDist': 80, 'param1': 40, 'param2': 25, 
+                 'minRadius': 70, 'maxRadius': 170}
             ]
             
-            for thresh_type in threshold_methods:
-                _, thresh = cv2.threshold(image, 0, 255, thresh_type)
-                thresh = cv2.bitwise_and(thresh, thresh, mask=mask)
+            for params in param_sets:
+                circles = cv2.HoughCircles(
+                    blurred,
+                    cv2.HOUGH_GRADIENT,
+                    **params
+                )
                 
-                # Very gentle morphological operations
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-                thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-                thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-                
-                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if 15 < area < 10000:  # Very broad range
-                        cell = self.create_cell_from_contour(contour, image)
-                        if cell:
-                            cells.append(cell)
+                if circles is not None:
+                    circles = np.round(circles[0, :]).astype("int")
+                    for (x, y, r) in circles:
+                        all_droplets.append({
+                            'x': x, 'y': y, 'r': r,
+                            'center': (x, y),
+                            'radius': r,
+                            'method': 'hough'
+                        })
             
-            return cells
+            return all_droplets
             
         except Exception as e:
-            print(f"Error in sensitive blob detection: {e}")
+            print(f"Error in Hough detection: {e}")
             return []
     
-    def detect_cells_log(self, image, mask):
-        """Laplacian of Gaussian for cell detection"""
+    def detect_droplets_by_template(self, image):
+        """Template matching for ring patterns"""
         try:
-            # Apply LoG filter
-            log_filtered = cv2.Laplacian(image, cv2.CV_64F, ksize=3)
-            log_filtered = np.absolute(log_filtered)
-            log_filtered = log_filtered.astype(np.uint8)
+            droplets = []
             
-            # Apply mask
-            log_filtered = cv2.bitwise_and(log_filtered, log_filtered, mask=mask)
+            # Create ring templates of various sizes
+            radii = range(70, 170, 20)
             
-            # Threshold
-            _, thresh = cv2.threshold(log_filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Find contours
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            cells = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if 10 < area < 5000:
-                    cell = self.create_cell_from_contour(contour, image)
-                    if cell:
-                        cells.append(cell)
-            
-            return cells
-            
-        except Exception as e:
-            print(f"Error in LoG detection: {e}")
-            return []
-    
-    def detect_cells_template_matching(self, image, mask):
-        """Template matching for circular cell-like objects"""
-        try:
-            cells = []
-            
-            # Create circular templates of different sizes
-            template_sizes = [8, 12, 16, 20, 25, 30]
-            
-            for size in template_sizes:
-                # Create circular template
-                template = np.zeros((size*2, size*2), dtype=np.uint8)
-                cv2.circle(template, (size, size), size//2, 255, -1)
+            for radius in radii:
+                # Create ring template
+                template_size = radius * 2 + 20
+                template = np.zeros((template_size, template_size), dtype=np.uint8)
+                center = template_size // 2
                 
-                # Apply template matching
+                # Draw outer circle
+                cv2.circle(template, (center, center), radius, 255, 3)
+                # Draw inner circle (for ring effect)
+                cv2.circle(template, (center, center), int(radius * 0.85), 128, 2)
+                
+                # Match template
                 result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
                 
-                # Find good matches
-                threshold = 0.3  # Lower threshold for more sensitivity
+                # Find peaks
+                threshold = 0.4
                 locations = np.where(result >= threshold)
                 
                 for pt in zip(*locations[::-1]):
-                    x, y = pt[0] + size, pt[1] + size
+                    x = pt[0] + center
+                    y = pt[1] + center
                     
-                    # Check if point is within mask
-                    if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0] and 
-                        mask[y, x] > 0):
-                        
-                        # Create synthetic contour
-                        center = (x, y)
-                        radius = size // 2
-                        area = np.pi * radius * radius
-                        
-                        # Calculate intensity in this region
-                        roi = image[max(0, y-radius):min(image.shape[0], y+radius),
-                                   max(0, x-radius):min(image.shape[1], x+radius)]
-                        intensity = np.mean(roi) if roi.size > 0 else 0
-                        
-                        cells.append({
-                            'center': center,
-                            'area': area,
-                            'intensity': intensity,
-                            'contour': None,  # No actual contour for template matches
-                            'circularity': 1.0,  # Templates are perfectly circular
-                            'detection_method': 'template'
-                        })
+                    droplets.append({
+                        'x': x, 'y': y, 'r': radius,
+                        'center': (x, y),
+                        'radius': radius,
+                        'method': 'template'
+                    })
             
-            return cells
+            return droplets
             
         except Exception as e:
             print(f"Error in template matching: {e}")
             return []
     
-    def detect_cells_watershed(self, image, mask):
-        """Watershed segmentation for overlapping cells"""
+    def merge_droplet_detections(self, droplets):
+        """Merge overlapping droplet detections"""
+        if not droplets:
+            return []
+        
+        merged = []
+        used = set()
+        
+        for i, d1 in enumerate(droplets):
+            if i in used:
+                continue
+            
+            # Find overlapping droplets
+            overlap_group = [d1]
+            for j, d2 in enumerate(droplets[i+1:], i+1):
+                if j in used:
+                    continue
+                
+                # Calculate distance between centers
+                dist = np.sqrt((d1['x'] - d2['x'])**2 + (d1['y'] - d2['y'])**2)
+                
+                # Check for overlap
+                if dist < (d1['r'] + d2['r']) * 0.5:
+                    overlap_group.append(d2)
+                    used.add(j)
+            
+            # Merge overlapping detections
+            if len(overlap_group) > 1:
+                avg_x = int(np.mean([d['x'] for d in overlap_group]))
+                avg_y = int(np.mean([d['y'] for d in overlap_group]))
+                avg_r = int(np.mean([d['r'] for d in overlap_group]))
+                
+                merged.append({
+                    'x': avg_x, 'y': avg_y, 'r': avg_r,
+                    'center': (avg_x, avg_y),
+                    'radius': avg_r
+                })
+                else:
+                merged.append(d1)
+        
+        return merged
+    
+    def validate_droplet_enhanced(self, image, x, y, r):
+        """Enhanced validation for both thick and thin ring droplets"""
         try:
+            # Check bounds
+            if x - r < 5 or y - r < 5 or x + r > image.shape[1] - 5 or y + r > image.shape[0] - 5:
+                return False
+            
+            # Sample ring intensities at multiple radii
+            angles = np.linspace(0, 2*np.pi, 48)
+            
+            # Check multiple ring positions (for thick and thin rings)
+            ring_scores = []
+            for radius_factor in [0.9, 0.95, 1.0, 1.05, 1.1]:
+                ring_intensities = []
+                for angle in angles:
+                    ring_x = int(x + r * radius_factor * np.cos(angle))
+                    ring_y = int(y + r * radius_factor * np.sin(angle))
+                    
+                    if 0 <= ring_x < image.shape[1] and 0 <= ring_y < image.shape[0]:
+                        ring_intensities.append(image[ring_y, ring_x])
+                
+                if ring_intensities:
+                    ring_scores.append(np.std(ring_intensities))
+            
+            # Check center vs ring contrast
+            center_region = image[max(0, y-10):min(image.shape[0], y+10), 
+                                max(0, x-10):min(image.shape[1], x+10)]
+            center_mean = np.mean(center_region)
+            
+            # Calculate ring statistics
+            best_ring_idx = np.argmax(ring_scores)
+            radius_factor = [0.9, 0.95, 1.0, 1.05, 1.1][best_ring_idx]
+            
+            ring_pixels = []
+            for angle in angles:
+                ring_x = int(x + r * radius_factor * np.cos(angle))
+                ring_y = int(y + r * radius_factor * np.sin(angle))
+                if 0 <= ring_x < image.shape[1] and 0 <= ring_y < image.shape[0]:
+                    ring_pixels.append(image[ring_y, ring_x])
+            
+            if not ring_pixels:
+                return False
+            
+            ring_mean = np.mean(ring_pixels)
+            ring_std = np.std(ring_pixels)
+            
+            # Validation criteria
+            # 1. Ring should have contrast with center
+            contrast = abs(center_mean - ring_mean)
+            
+            # 2. Ring should have some variation (not uniform)
+            # 3. For thin rings, contrast might be lower
+            is_valid = (contrast > 10 or ring_std > 15) and ring_std > 5
+            
+            return is_valid
+            
+        except Exception as e:
+            print(f"Error validating droplet: {e}")
+            return False
+    
+    def detect_cancer_cells_tritc_guided(self, bf_image, tritc_image, droplet):
+        """TRITC-guided cancer cell detection"""
+        try:
+            x, y, r = droplet['x'], droplet['y'], droplet['r']
+            
+            # Create mask for droplet interior
+            mask = np.zeros(bf_image.shape, dtype=np.uint8)
+            cv2.circle(mask, (x, y), int(r * 0.85), 255, -1)
+            
+            # Normalize images
+            bf_norm = self.normalize_image(bf_image)
+            tritc_norm = self.normalize_image(tritc_image)
+            
+            # Find TRITC-positive regions first
+            tritc_masked = cv2.bitwise_and(tritc_norm, tritc_norm, mask=mask)
+            
+            # Adaptive threshold on TRITC to find positive regions
+            tritc_blur = cv2.GaussianBlur(tritc_masked, (5, 5), 1)
+            
+            # Use multiple thresholds to catch different intensity levels
+            cancer_cells = []
+            
+            # Method 1: Otsu threshold on TRITC
+            if np.max(tritc_blur) > 10:  # Only if there's signal
+                _, tritc_thresh = cv2.threshold(tritc_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                cells1 = self.extract_cells_from_tritc_mask(tritc_thresh, bf_norm, tritc_norm, mask)
+                cancer_cells.extend(cells1)
+            
+            # Method 2: Percentile-based threshold
+            tritc_in_droplet = tritc_blur[mask > 0]
+            if len(tritc_in_droplet) > 0:
+                threshold_percentiles = [75, 85, 95]
+                for percentile in threshold_percentiles:
+                    thresh_val = np.percentile(tritc_in_droplet[tritc_in_droplet > 0], percentile) if np.any(tritc_in_droplet > 0) else 0
+                    if thresh_val > 5:
+                        _, tritc_thresh = cv2.threshold(tritc_blur, thresh_val, 255, cv2.THRESH_BINARY)
+                        cells2 = self.extract_cells_from_tritc_mask(tritc_thresh, bf_norm, tritc_norm, mask)
+                        cancer_cells.extend(cells2)
+            
+            # Method 3: Local maxima in TRITC channel
+            cells3 = self.detect_cells_by_tritc_peaks(tritc_blur, bf_norm, mask)
+            cancer_cells.extend(cells3)
+            
+            # Method 4: Watershed on TRITC signal
+            cells4 = self.detect_cells_by_tritc_watershed(tritc_blur, bf_norm, mask)
+            cancer_cells.extend(cells4)
+            
+            # Merge duplicate detections
+            merged_cells = self.merge_cancer_cells(cancer_cells)
+            
+            # Classify cells by viability based on TRITC intensity
+            for cell in merged_cells:
+                # Higher TRITC = more viable
+                if cell['tritc_intensity'] > 30:
+                    cell['viable'] = True
+                    cell['viability_score'] = 'high'
+                elif cell['tritc_intensity'] > 15:
+                    cell['viable'] = True
+                    cell['viability_score'] = 'medium'
+                else:
+                    cell['viable'] = False
+                    cell['viability_score'] = 'low'
+            
+            return {
+                'cancer_cells': merged_cells,
+                'total_cells': len(merged_cells),
+                'viable_cells': len([c for c in merged_cells if c['viable']])
+            }
+            
+        except Exception as e:
+            print(f"Error in TRITC-guided detection: {e}")
+            return {'cancer_cells': [], 'total_cells': 0, 'viable_cells': 0}
+    
+    def normalize_image(self, image):
+        """Normalize image to uint8"""
+        if image.dtype == np.uint8:
+            return image
+        
+        img_min = image.min()
+        img_max = image.max()
+        if img_max > img_min:
+            return ((image - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+        return np.zeros_like(image, dtype=np.uint8)
+    
+    def extract_cells_from_tritc_mask(self, tritc_mask, bf_image, tritc_image, droplet_mask):
+        """Extract individual cells from TRITC mask"""
+        try:
+            cells = []
+            
+            # Clean up mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            cleaned = cv2.morphologyEx(tritc_mask, cv2.MORPH_OPEN, kernel)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+            
+            # Find connected components
+            num_labels, labels = cv2.connectedComponents(cleaned)
+            
+            for label in range(1, num_labels):
+                # Get component mask
+                component_mask = (labels == label).astype(np.uint8) * 255
+                
+                # Check if component is within droplet
+                if cv2.countNonZero(cv2.bitwise_and(component_mask, droplet_mask)) == 0:
+                    continue
+                
+                # Get component properties
+                contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    continue
+                
+                contour = contours[0]
+                    area = cv2.contourArea(contour)
+                
+                # Filter by size
+                if area < 20 or area > 5000:
+                    continue
+                
+                # Get centroid
+                M = cv2.moments(contour)
+                if M["m00"] == 0:
+                    continue
+                
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                
+                # Calculate properties
+                perimeter = cv2.arcLength(contour, True)
+                circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                
+                # Get intensity values
+                tritc_intensity = cv2.mean(tritc_image, mask=component_mask)[0]
+                bf_intensity = cv2.mean(bf_image, mask=component_mask)[0]
+                
+                cells.append({
+                    'center': (cx, cy),
+                    'area': area,
+                    'contour': contour,
+                    'circularity': circularity,
+                    'tritc_intensity': tritc_intensity,
+                    'bf_intensity': bf_intensity,
+                    'method': 'tritc_mask'
+                })
+            
+            return cells
+            
+        except Exception as e:
+            print(f"Error extracting cells from TRITC mask: {e}")
+            return []
+    
+    def detect_cells_by_tritc_peaks(self, tritc_image, bf_image, mask):
+        """Detect cells by finding local maxima in TRITC signal"""
+        try:
+            cells = []
+            
             # Apply mask
-            masked = cv2.bitwise_and(image, image, mask=mask)
+            tritc_masked = cv2.bitwise_and(tritc_image, tritc_image, mask=mask)
+            
+            # Find local maxima
+            local_maxima = peak_local_max(tritc_masked, min_distance=10, 
+                                         threshold_abs=10, indices=True)
+            
+            for peak in local_maxima:
+                y, x = peak
+                
+                # Check if peak is within mask
+                if mask[y, x] == 0:
+                    continue
+                
+                # Grow region from peak
+                region_mask = np.zeros_like(tritc_image)
+                cv2.circle(region_mask, (x, y), 15, 255, -1)
+                region_mask = cv2.bitwise_and(region_mask, mask)
+                
+                # Get region properties
+                tritc_intensity = tritc_image[y, x]
+                bf_intensity = bf_image[y, x]
+                
+                # Estimate cell area around peak
+                area = np.pi * 15 * 15
+                        
+                        cells.append({
+                    'center': (x, y),
+                            'area': area,
+                    'contour': None,
+                    'circularity': 0.8,
+                    'tritc_intensity': tritc_intensity,
+                    'bf_intensity': bf_intensity,
+                    'method': 'tritc_peak'
+                        })
+            
+            return cells
+            
+        except Exception as e:
+            print(f"Error in peak detection: {e}")
+            return []
+    
+    def detect_cells_by_tritc_watershed(self, tritc_image, bf_image, mask):
+        """Watershed segmentation on TRITC signal"""
+        try:
+            cells = []
+            
+            # Apply mask and threshold
+            tritc_masked = cv2.bitwise_and(tritc_image, tritc_image, mask=mask)
+            
+            # Skip if no significant signal
+            if np.max(tritc_masked) < 15:
+                return []
+            
+            # Threshold
+            _, binary = cv2.threshold(tritc_masked, 15, 255, cv2.THRESH_BINARY)
             
             # Distance transform
-            _, thresh = cv2.threshold(masked, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
             
-            # Remove noise
-            kernel = np.ones((2, 2), np.uint8)
-            opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-            
-            # Sure background area
-            sure_bg = cv2.dilate(opening, kernel, iterations=2)
-            
-            # Distance transform
-            dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-            
-            # Sure foreground area
+            # Find peaks
             _, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
             sure_fg = np.uint8(sure_fg)
             
-            # Unknown region
+            # Find unknown region
+            kernel = np.ones((3, 3), np.uint8)
+            sure_bg = cv2.dilate(binary, kernel, iterations=2)
             unknown = cv2.subtract(sure_bg, sure_fg)
             
             # Marker labelling
@@ -534,128 +689,60 @@ class CellAnalyzer:
             markers[unknown == 255] = 0
             
             # Apply watershed
-            img_for_watershed = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            img_for_watershed = cv2.cvtColor(tritc_image, cv2.COLOR_GRAY2BGR)
             markers = cv2.watershed(img_for_watershed, markers)
             
             # Extract cells from watershed regions
-            cells = []
             for marker_id in np.unique(markers):
                 if marker_id <= 1:  # Skip background and borders
                     continue
                 
                 # Create mask for this marker
                 cell_mask = (markers == marker_id).astype(np.uint8) * 255
+                cell_mask = cv2.bitwise_and(cell_mask, mask)
                 
-                # Find contour
+                # Get properties
                 contours, _ = cv2.findContours(cell_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    continue
                 
-                if contours:
                     contour = contours[0]
                     area = cv2.contourArea(contour)
-                    if 20 < area < 5000:
-                        cell = self.create_cell_from_contour(contour, image)
-                        if cell:
-                            cells.append(cell)
-            
-            return cells
-            
-        except Exception as e:
-            print(f"Error in watershed detection: {e}")
-            return []
-    
-    def create_cell_from_contour(self, contour, image):
-        """Create cell object from contour with better error handling"""
-        try:
-            area = cv2.contourArea(contour)
-            if area < 10:  # Skip tiny areas
-                return None
+                
+                if area < 20 or area > 3000:
+                    continue
             
             # Get centroid
             M = cv2.moments(contour)
             if M["m00"] == 0:
-                return None
+                    continue
                 
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
             
-            # Check if center is within image bounds
-            if not (0 <= cx < image.shape[1] and 0 <= cy < image.shape[0]):
-                return None
-            
-            # Calculate circularity
-            perimeter = cv2.arcLength(contour, True)
-            circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
-            
-            # Calculate mean intensity
-            try:
-                cell_mask = np.zeros_like(image)
-                cv2.drawContours(cell_mask, [contour], -1, 255, -1)
-                mean_intensity = cv2.mean(image, mask=cell_mask)[0]
-            except:
-                mean_intensity = 0
-            
-            return {
-                'center': (cx, cy),
-                'area': area,
-                'intensity': mean_intensity,
-                'contour': contour,
-                'circularity': circularity,
-                'detection_method': 'contour'
-            }
-            
-        except Exception as e:
-            print(f"Error creating cell from contour: {e}")
-            return None
-    
-    def find_cell_contours(self, thresh_image, original_image, method):
-        """Find cell contours from thresholded image"""
-        try:
-            # Morphological operations
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            cleaned = cv2.morphologyEx(thresh_image, cv2.MORPH_OPEN, kernel)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-            
-            # Find contours
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            cells = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if 50 < area < 5000:  # Cell size range
                     # Calculate properties
-                    M = cv2.moments(contour)
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        
-                        # Calculate circularity
-                        perimeter = cv2.arcLength(contour, True)
-                        circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
-                        
-                        # Calculate mean intensity
-                        cell_mask = np.zeros_like(original_image)
-                        cv2.drawContours(cell_mask, [contour], -1, 255, -1)
-                        mean_intensity = cv2.mean(original_image, mask=cell_mask)[0]
+                tritc_intensity = cv2.mean(tritc_image, mask=cell_mask)[0]
+                bf_intensity = cv2.mean(bf_image, mask=cell_mask)[0]
                         
                         cells.append({
                             'center': (cx, cy),
                             'area': area,
-                            'intensity': mean_intensity,
                             'contour': contour,
-                            'circularity': circularity,
-                            'detection_method': method
+                    'circularity': 0.7,
+                    'tritc_intensity': tritc_intensity,
+                    'bf_intensity': bf_intensity,
+                    'method': 'tritc_watershed'
                         })
             
             return cells
             
         except Exception as e:
-            print(f"Error finding contours: {e}")
+            print(f"Error in watershed segmentation: {e}")
             return []
     
-    def merge_duplicate_cells(self, cells):
-        """Enhanced duplicate removal with better distance checking"""
-        try:
-            if len(cells) == 0:
+    def merge_cancer_cells(self, cells):
+        """Merge duplicate cancer cell detections"""
+        if not cells:
                 return []
             
             merged = []
@@ -666,215 +753,228 @@ class CellAnalyzer:
                     continue
                     
                 # Find nearby cells
-                nearby_cells = [cell1]
-                for j, cell2 in enumerate(cells):
-                    if j <= i or j in used:
+            nearby_group = [cell1]
+            for j, cell2 in enumerate(cells[i+1:], i+1):
+                if j in used:
                         continue
                     
-                    # Calculate distance between centers
+                # Calculate distance
                     dist = np.sqrt((cell1['center'][0] - cell2['center'][0])**2 + 
                                  (cell1['center'][1] - cell2['center'][1])**2)
                     
-                    # Use smaller merge distance for better precision
-                    merge_distance = min(20, max(8, np.sqrt(max(cell1['area'], cell2['area'])) * 0.8))
-                    
-                    if dist < merge_distance:
-                        nearby_cells.append(cell2)
+                # Merge if very close
+                if dist < 15:
+                    nearby_group.append(cell2)
                         used.add(j)
                 
-                # Keep the cell with best properties (largest area or highest intensity)
-                if len(nearby_cells) > 1:
-                    best_cell = max(nearby_cells, key=lambda c: c['area'] * c['intensity'])
+            # Keep cell with highest TRITC intensity
+            if len(nearby_group) > 1:
+                best_cell = max(nearby_group, key=lambda c: c['tritc_intensity'])
+                # Update area to combined area
+                best_cell['area'] = sum(c['area'] for c in nearby_group) / len(nearby_group)
                 else:
                     best_cell = cell1
                     
                 merged.append(best_cell)
                 used.add(i)
             
-            print(f"Merged {len(cells)} detections into {len(merged)} cells")
             return merged
-            
-        except Exception as e:
-            print(f"Error merging cells: {e}")
-            return cells
     
     def analyze_current_frame(self):
-        """Analyze the current timepoint for all droplets"""
-        if self.nd2_file is None:
+        """Analyze the current frame for droplets and cells"""
+        if not self.nd2_file:
+            messagebox.showwarning("Warning", "Please load an ND2 file first")
             return
             
         try:
-            self.status_label.config(text="🔍 Analyzing current frame...", foreground='orange')
+            self.status_label.config(text="Analyzing current frame...", foreground='orange')
             self.root.update()
             
-            # Get both channel images
-            bf_image = self.nd2_file.get_frame_2D(c=0, t=self.current_timepoint)
-            tritc_image = self.nd2_file.get_frame_2D(c=1, t=self.current_timepoint)
+            # Get current frame
+            frame = self.nd2_file[self.current_timepoint]
             
-            # Detect droplets
-            self.detected_droplets = self.detect_droplets(bf_image)
+            # Get brightfield and TRITC channels
+            bf_channel = None
+            tritc_channel = None
             
-            # Analyze each droplet
-            analysis_results = []
+            for i, channel in enumerate(self.channels):
+                if 'bf' in channel.lower() or 'bright' in channel.lower() or 'phase' in channel.lower():
+                    bf_channel = i
+                elif 'tritc' in channel.lower() or 'red' in channel.lower():
+                    tritc_channel = i
+            
+            if bf_channel is None:
+                bf_channel = 0  # Default to first channel
+            
+            # Get images
+            bf_image = frame[bf_channel]
+            tritc_image = frame[tritc_channel] if tritc_channel is not None else bf_image
+            
+            # Detect droplets using enhanced method
+            self.detected_droplets = self.detect_droplets_enhanced(bf_image)
+            
+            # Analyze each droplet for cancer cells
+            total_cells = 0
+            total_viable = 0
+            
             for droplet in self.detected_droplets:
-                cell_data = self.detect_cells_in_droplet(bf_image, tritc_image, droplet)
-                droplet['cell_data'] = cell_data
-                
-                k562_count = len(cell_data['k562_cells'])
-                nk_count = len(cell_data['nk_cells'])
-                viable_k562 = len([c for c in cell_data['k562_cells'] if c['viable']])
-                
-                analysis_results.append(f"Droplet {droplet['id']}: {k562_count} K562 cells ({viable_k562} viable), {nk_count} NK cells")
-            
-            # Update results display
-            self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(tk.END, f"Analysis Results - Timepoint {self.current_timepoint + 1}:\\n")
-            self.results_text.insert(tk.END, f"Found {len(self.detected_droplets)} droplets\\n\\n")
-            for result in analysis_results:
-                self.results_text.insert(tk.END, result + "\\n")
-            
-            # Store results
-            self.cell_data[self.current_timepoint] = self.detected_droplets.copy()
+                cell_analysis = self.detect_cancer_cells_tritc_guided(bf_image, tritc_image, droplet)
+                droplet['cell_analysis'] = cell_analysis
+                total_cells += cell_analysis['total_cells']
+                total_viable += cell_analysis['viable_cells']
             
             # Update display
             self.update_analysis_display(bf_image, tritc_image)
             
+            # Update results text
+            results_summary = f"Analysis Results:\n"
+            results_summary += f"• Droplets detected: {len(self.detected_droplets)}\n"
+            results_summary += f"• Total cancer cells: {total_cells}\n"
+            results_summary += f"• Viable cells: {total_viable}\n"
+            results_summary += f"• Timepoint: {self.current_timepoint + 1}/{self.total_timepoints}"
+            
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(1.0, results_summary)
+            
             # Enable export
             self.export_btn.configure(state="normal")
             
-            self.status_label.config(text=f"✅ Analysis complete - Found {len(self.detected_droplets)} droplets", 
+            self.status_label.config(text=f"✅ Analysis complete: {len(self.detected_droplets)} droplets, {total_cells} cells", 
                                    foreground='green')
             
         except Exception as e:
-            messagebox.showerror("Error", f"Analysis failed:\\n{str(e)}")
+            messagebox.showerror("Error", f"Analysis failed:\n{str(e)}")
             self.status_label.config(text="❌ Analysis failed", foreground='red')
     
     def update_analysis_display(self, bf_image, tritc_image):
-        """Update the four-panel display with analysis results"""
+        """Update the display with analysis results"""
         try:
             # Clear all axes
             for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
                 ax.clear()
             
-            # Panel 1: Original Brightfield
-            self.ax1.imshow(bf_image, cmap='gray')
-            self.ax1.set_title(f"Brightfield - T{self.current_timepoint+1}", fontsize=14, fontweight='bold')
+            # Normalize images for display
+            bf_display = self.normalize_image(bf_image)
+            tritc_display = self.normalize_image(tritc_image)
+            
+            # Plot 1: Original brightfield
+            self.ax1.imshow(bf_display, cmap='gray')
+            self.ax1.set_title('Brightfield Image', fontsize=12, fontweight='bold')
             self.ax1.axis('off')
             
-            # Panel 2: Original TRITC
-            self.ax2.imshow(tritc_image, cmap='hot')
-            self.ax2.set_title(f"TRITC (K562 stain) - T{self.current_timepoint+1}", fontsize=14, fontweight='bold')
+            # Plot 2: TRITC channel
+            self.ax2.imshow(tritc_display, cmap='hot')
+            self.ax2.set_title('TRITC Channel', fontsize=12, fontweight='bold')
             self.ax2.axis('off')
             
-            # Panel 3: Droplet Detection
-            display_img = cv2.cvtColor(bf_image.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+            # Plot 3: Droplet detection
+            self.ax3.imshow(bf_display, cmap='gray')
             for droplet in self.detected_droplets:
-                x, y, r = droplet['x'], droplet['y'], droplet['r']
-                cv2.circle(display_img, (x, y), r, (0, 255, 0), 3)
-                cv2.putText(display_img, f"D{droplet['id']}", (x-15, y-r-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            
-            self.ax3.imshow(display_img)
-            self.ax3.set_title(f"Droplet Detection - Found {len(self.detected_droplets)}", 
-                              fontsize=14, fontweight='bold')
+                circle = plt.Circle((droplet['x'], droplet['y']), droplet['r'], 
+                                  fill=False, color='red', linewidth=2)
+                self.ax3.add_patch(circle)
+                self.ax3.text(droplet['x'], droplet['y'] - droplet['r'] - 10, 
+                             f"D{droplet['id']}", color='red', fontsize=10, 
+                             ha='center', fontweight='bold')
+            self.ax3.set_title(f'Droplet Detection ({len(self.detected_droplets)} found)', 
+                              fontsize=12, fontweight='bold')
             self.ax3.axis('off')
             
-            # Panel 4: Cell Analysis
-            analysis_img = cv2.cvtColor(bf_image.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+            # Plot 4: Cell detection
+            self.ax4.imshow(bf_display, cmap='gray')
+            cell_count = 0
             for droplet in self.detected_droplets:
-                x, y, r = droplet['x'], droplet['y'], droplet['r']
-                cv2.circle(analysis_img, (x, y), r, (255, 255, 255), 2)
+                # Draw droplet boundary
+                circle = plt.Circle((droplet['x'], droplet['y']), droplet['r'], 
+                                  fill=False, color='blue', linewidth=2, alpha=0.7)
+                self.ax4.add_patch(circle)
                 
-                if 'cell_data' in droplet:
-                    # Draw K562 cells
-                    for cell in droplet['cell_data']['k562_cells']:
-                        color = (0, 255, 0) if cell['viable'] else (0, 0, 255)
-                        cv2.circle(analysis_img, cell['center'], 10, color, -1)
-                        # Add TRITC intensity
-                        tritc_val = int(cell.get('tritc_intensity', 0))
-                        cv2.putText(analysis_img, str(tritc_val), 
-                                   (cell['center'][0]-8, cell['center'][1]-12), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-                    
-                    # Draw NK cells
-                    for cell in droplet['cell_data']['nk_cells']:
-                        color = (255, 0, 0) if cell['viable'] else (128, 0, 128)
-                        cv2.circle(analysis_img, cell['center'], 5, color, -1)
-                    
-                    # Add summary text
-                    k562_count = len(droplet['cell_data']['k562_cells'])
-                    nk_count = len(droplet['cell_data']['nk_cells'])
-                    viable_k562 = len([c for c in droplet['cell_data']['k562_cells'] if c['viable']])
-                    
-                    text = f"K:{k562_count}({viable_k562}v) N:{nk_count}"
-                    cv2.putText(analysis_img, text, (x-40, y+r+20), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Draw cells
+                if 'cell_analysis' in droplet:
+                    for cell in droplet['cell_analysis']['cancer_cells']:
+                        cell_count += 1
+                        color = 'green' if cell['viable'] else 'yellow'
+                        cell_circle = plt.Circle(cell['center'], 5, 
+                                               fill=True, color=color, alpha=0.8)
+                        self.ax4.add_patch(cell_circle)
             
-            self.ax4.imshow(analysis_img)
-            self.ax4.set_title("Cell Analysis (Green=Viable K562, Red=Dead K562, Blue=NK)", 
-                              fontsize=14, fontweight='bold')
+            self.ax4.set_title(f'Cell Detection ({cell_count} cells)', 
+                              fontsize=12, fontweight='bold')
             self.ax4.axis('off')
             
+            # Adjust layout and redraw
+            self.fig.tight_layout()
             self.canvas.draw()
             
         except Exception as e:
             print(f"Error updating display: {e}")
     
     def on_timepoint_change(self, value):
-        if self.nd2_file is None:
-            return
-            
+        """Handle timepoint slider change"""
+        try:
         self.current_timepoint = int(float(value))
         self.timepoint_label.config(text=f"{self.current_timepoint + 1} / {self.total_timepoints}")
         self.update_display()
+        except Exception as e:
+            print(f"Error changing timepoint: {e}")
         
     def on_channel_change(self, event):
-        if self.nd2_file is None:
-            return
-            
+        """Handle channel selection change"""
+        try:
         self.current_channel = self.channel_combo.current()
         self.update_display()
+        except Exception as e:
+            print(f"Error changing channel: {e}")
         
     def update_display(self):
-        if self.nd2_file is None:
+        """Update the main display with current frame"""
+        if not self.nd2_file:
             return
             
         try:
-            # Get current image
-            current_image = self.nd2_file.get_frame_2D(c=self.current_channel, t=self.current_timepoint)
+            # Get current frame
+            frame = self.nd2_file[self.current_timepoint]
             
-            # Clear previous plots
+            # Get current channel image
+            if self.current_channel < len(frame):
+                image = frame[self.current_channel]
+                
+                # Clear all axes
             for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
                 ax.clear()
             
-            # Simple display for navigation
-            self.ax1.imshow(current_image, cmap='gray' if self.current_channel == 0 else 'hot')
-            self.ax1.set_title(f"{self.channels[self.current_channel]} - T{self.current_timepoint+1}")
-            self.ax1.axis('off')
-            
-            # Show message in other panels
-            for ax, title in zip([self.ax2, self.ax3, self.ax4], 
-                               ["Click 'Analyze Current Frame'", "to see detailed", "analysis results"]):
-                ax.text(0.5, 0.5, title, ha='center', va='center', fontsize=16, 
-                       transform=ax.transAxes)
+                # Normalize image for display
+                display_image = self.normalize_image(image)
+                
+                # Show same image in all panels initially
+                for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
+                    ax.imshow(display_image, cmap='gray')
                 ax.axis('off')
             
+                self.ax1.set_title(f'Channel: {self.channels[self.current_channel]}', 
+                                  fontsize=12, fontweight='bold')
+                self.ax2.set_title('Channel 2', fontsize=12, fontweight='bold')
+                self.ax3.set_title('Channel 3', fontsize=12, fontweight='bold')
+                self.ax4.set_title('Channel 4', fontsize=12, fontweight='bold')
+                
+                # Adjust layout and redraw
+                self.fig.tight_layout()
             self.canvas.draw()
             
         except Exception as e:
-            self.status_label.config(text=f"Error displaying image: {str(e)}")
+            print(f"Error updating display: {e}")
     
     def export_results(self):
         """Export analysis results to CSV"""
-        if not self.cell_data:
-            messagebox.showwarning("Warning", "No analysis data to export")
+        if not self.detected_droplets:
+            messagebox.showwarning("Warning", "No analysis results to export")
             return
             
         try:
             file_path = filedialog.asksaveasfilename(
+                title="Save Results",
                 defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-                title="Save analysis results"
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
             )
             
             if not file_path:
@@ -882,50 +982,42 @@ class CellAnalyzer:
                 
             # Prepare data for export
             export_data = []
-            for timepoint, droplets in self.cell_data.items():
-                for droplet in droplets:
-                    if 'cell_data' in droplet:
-                        k562_count = len(droplet['cell_data']['k562_cells'])
-                        nk_count = len(droplet['cell_data']['nk_cells'])
-                        viable_k562 = len([c for c in droplet['cell_data']['k562_cells'] if c['viable']])
-                        dead_k562 = k562_count - viable_k562
-                        
-                        export_data.append({
-                            'Timepoint': timepoint + 1,
+            
+            for droplet in self.detected_droplets:
+                droplet_data = {
+                    'Timepoint': self.current_timepoint + 1,
                             'Droplet_ID': droplet['id'],
                             'Droplet_X': droplet['x'],
                             'Droplet_Y': droplet['y'],
                             'Droplet_Radius': droplet['r'],
-                            'K562_Total': k562_count,
-                            'K562_Viable': viable_k562,
-                            'K562_Dead': dead_k562,
-                            'NK_Count': nk_count,
-                            'Total_Cells': k562_count + nk_count
-                        })
+                    'Total_Cells': 0,
+                    'Viable_Cells': 0
+                }
+                
+                if 'cell_analysis' in droplet:
+                    droplet_data['Total_Cells'] = droplet['cell_analysis']['total_cells']
+                    droplet_data['Viable_Cells'] = droplet['cell_analysis']['viable_cells']
+                
+                export_data.append(droplet_data)
             
-            # Save to CSV
+            # Create DataFrame and save
             df = pd.DataFrame(export_data)
             df.to_csv(file_path, index=False)
             
-            messagebox.showinfo("Success", f"Results exported to {file_path}")
+            messagebox.showinfo("Success", f"Results exported to:\n{file_path}")
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export results:\n{str(e)}")
+            messagebox.showerror("Error", f"Export failed:\n{str(e)}")
     
     def run(self):
+        """Start the application"""
         self.root.mainloop()
         
     def __del__(self):
-        if self.nd2_file:
+        """Cleanup when object is destroyed"""
+        if hasattr(self, 'nd2_file') and self.nd2_file:
             self.nd2_file.close()
 
 if __name__ == "__main__":
-    if not ND2_AVAILABLE:
-        print("Installing nd2reader...")
-        import subprocess
-        import sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "nd2reader"])
-        print("Please restart the program.")
-    else:
         app = CellAnalyzer()
         app.run()
